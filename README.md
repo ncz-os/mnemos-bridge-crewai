@@ -63,6 +63,38 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Testing
+
+The canonical proof of the integration is split into two tiers:
+
+- Tier 1 offline adapter and tool-wrapper tests:
+
+  ```bash
+  pip install -e .
+  pytest tests/test_adapter_offline.py tests/test_tool_factory_offline.py -v
+  ```
+
+- Tier 2 live CrewAI kickoff test against a real MNEMOS MCP HTTP/SSE endpoint:
+
+  ```bash
+  export MNEMOS_TEST_BASE="http://192.168.207.67:5003"
+  export MNEMOS_MCP_TOKEN="your-mnemos-token"
+  export OPENAI_API_KEY="your-openai-key"
+  pytest tests/integration/test_crewai_crew_kickoff.py -v
+  ```
+
+The tier-2 test builds a one-agent CrewAI Crew, calls `crew.kickoff()`, records
+the live MCP dispatcher boundary, and verifies that at least one MNEMOS MCP tool
+was invoked end to end. It is skipped unless `MNEMOS_TEST_BASE`,
+`MNEMOS_MCP_TOKEN`, and either `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` are set.
+
+For a full local verification pass, run:
+
+```bash
+pytest tests/ -v
+pytest tests/integration -v --collect-only
+```
+
 ## JSON Schema Coverage
 
 The adapter supports the JSON Schema shape typically used by MCP tool inputs:
