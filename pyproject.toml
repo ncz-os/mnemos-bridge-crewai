@@ -32,6 +32,7 @@ packages = ["src/mnemos_bridge_crewai"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.ruff]

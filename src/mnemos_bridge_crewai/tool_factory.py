@@ -29,6 +29,12 @@ except ImportError:
                     for key, value in kwargs.items():
                         setattr(self, key, value)
 
+                def run(self, **kwargs: Any) -> Any:
+                    return self._run(**kwargs)
+
+                async def arun(self, **kwargs: Any) -> Any:
+                    return await self._arun(**kwargs)
+
 
 def create_crewai_tool(tool_schema: Any, dispatcher: Any) -> type[BaseTool]:
     """

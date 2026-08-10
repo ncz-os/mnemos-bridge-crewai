@@ -6,7 +6,10 @@ import sys
 from types import TracebackType
 from typing import Any
 
-from mnemos_bridge_core import McpClient
+try:
+    from mnemos_bridge_core import McpClient
+except ImportError:  # pragma: no cover - exercised when optional runtime dependency is absent.
+    McpClient = None  # type: ignore[assignment]
 
 try:
     from mnemos_bridge_core.dispatch import dispatch as core_dispatch
@@ -107,6 +110,11 @@ class MnemosCrewAIAdapter:
 
     @staticmethod
     def _build_client(mcp_url: str, mcp_token: str, timeout: int) -> Any:
+        if McpClient is None:
+            raise RuntimeError(
+                "mnemos_bridge_core is required to connect. "
+                "Install mnemos-bridge-core>=0.1.0."
+            )
         factory = getattr(McpClient, "from_url", None)
         if factory is not None:
             return factory(mcp_url, token=mcp_token, timeout=timeout)
