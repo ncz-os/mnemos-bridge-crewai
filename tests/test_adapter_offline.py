@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from unittest.mock import patch
 
-from mnemos_bridge_crewai.adapter import MnemosCrewAIAdapter
-from mnemos_bridge_crewai.tool_factory import BaseTool
+import pytest
+
+from mnemos_bridge_crewai.adapter import MnemosCrewAIAdapter, _McpDispatcher, _result_to_text
+from mnemos_bridge_crewai.tool_factory import BaseTool, create_crewai_tool
 
 
 @dataclass
@@ -64,6 +67,37 @@ async def test_connect_succeeds_without_network_and_returns_crewai_tools() -> No
         "write_memory",
         "delete_memory",
     ]
+
+
+async def test_sync_tool_run_from_worker_dispatches_on_connection_loop() -> None:
+    owner_loop = asyncio.get_running_loop()
+
+    class LoopCheckingClient:
+        async def call_tool(self, name: str, args: dict) -> str:
+            assert asyncio.get_running_loop() is owner_loop
+            return f"{name}:{args['query']}"
+
+    dispatcher = _McpDispatcher(LoopCheckingClient(), timeout=3)
+    schema = ToolSchemaStub("search_memories", "Search.", _schema("query"))
+    tool = create_crewai_tool(schema, dispatcher)()
+
+    result = await asyncio.to_thread(tool.run, query="mnemos")
+
+    assert result == "search_memories:mnemos"
+
+
+def test_mcp_error_result_raises_with_server_text() -> None:
+    @dataclass
+    class TextBlock:
+        text: str
+
+    @dataclass
+    class ErrorResult:
+        content: list[TextBlock]
+        is_error: bool = True
+
+    with pytest.raises(RuntimeError, match="invalid limit"):
+        _result_to_text(ErrorResult([TextBlock("invalid limit")]))
 
 
 def _schema(field_name: str) -> dict:

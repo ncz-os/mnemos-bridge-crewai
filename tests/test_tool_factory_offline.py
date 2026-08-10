@@ -30,13 +30,16 @@ def test_simple_schema_required_string_and_optional_int_fields() -> None:
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "limit": {"type": "integer"},
+                "limit": {"type": "integer", "default": 10},
+                "mode": {"type": "string", "default": "semantic"},
+                "cursor": {"type": "string"},
             },
             "required": ["query"],
         },
     )
 
-    tool_cls = create_crewai_tool(schema, DispatcherStub())
+    dispatcher = DispatcherStub()
+    tool_cls = create_crewai_tool(schema, dispatcher)
     args_schema = _get_args_schema_model(tool_cls)
     assert args_schema is not None
     fields = args_schema.model_fields
@@ -45,6 +48,12 @@ def test_simple_schema_required_string_and_optional_int_fields() -> None:
     assert fields["query"].is_required()
     assert _is_optional_of(fields["limit"].annotation, int)
     assert not fields["limit"].is_required()
+    assert fields["limit"].default == 10
+    assert fields["mode"].default == "semantic"
+    assert args_schema.model_validate({"query": "x"}).model_dump() == {"query": "x"}
+
+    assert tool_cls().run(query="x") == '{"ok": true}'
+    assert dispatcher.calls == [("search_memories", {"query": "x"})]
 
 
 def test_array_field_uses_list_annotation() -> None:
@@ -109,7 +118,7 @@ def test_nested_object_field_one_level_uses_dict_annotation() -> None:
     assert args_schema.model_fields["metadata"].annotation is dict
 
 
-def test_exotic_schema_one_of_falls_back_to_kwargs_model() -> None:
+def test_exotic_schema_preserves_top_level_argument_names() -> None:
     schema = ToolSchemaStub(
         name="exotic_memory",
         description="Use exotic schema.",
@@ -131,9 +140,34 @@ def test_exotic_schema_one_of_falls_back_to_kwargs_model() -> None:
     assert args_schema is not None
     fields = args_schema.model_fields
 
-    assert list(fields) == ["kwargs"]
-    assert fields["kwargs"].annotation is dict
-    assert "Generic kwargs model" in (args_schema.__doc__ or "")
+    assert list(fields) == ["query"]
+    assert not fields["query"].is_required()
+
+
+def test_deep_array_schema_dispatches_under_original_top_level_name() -> None:
+    schema = ToolSchemaStub(
+        name="bulk_create_memories",
+        description="Create memories.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                }
+            },
+            "required": ["memories"],
+        },
+    )
+    dispatcher = DispatcherStub()
+    tool = create_crewai_tool(schema, dispatcher)()
+    memories = [{"content": "remember this"}]
+
+    assert tool.run(memories=memories) == '{"ok": true}'
+    assert dispatcher.calls == [("bulk_create_memories", {"memories": memories})]
 
 
 def test_created_tool_metadata_and_args_schema_match_schema() -> None:
@@ -180,5 +214,7 @@ def test_run_is_callable_and_invokes_dispatcher() -> None:
 def _is_optional_of(annotation: object, expected: type) -> bool:
     origin = get_origin(annotation)
     return origin is Optional or (
-        origin is not None and type(None) in get_args(annotation) and expected in get_args(annotation)
+        origin is not None
+        and type(None) in get_args(annotation)
+        and expected in get_args(annotation)
     )

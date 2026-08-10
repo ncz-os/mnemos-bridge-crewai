@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os
@@ -27,26 +26,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_one_agent_crewai_crew_kickoff_dispatches_live_mnemos_tool() -> None:
+@pytest.mark.asyncio
+async def test_one_agent_crewai_crew_kickoff_dispatches_live_mnemos_tool() -> None:
     with _deadline(seconds=30):
         crewai = pytest.importorskip("crewai")
-        _run_live_crew_kickoff(crewai)
+        await _run_live_crew_kickoff(crewai)
 
 
-def _run_live_crew_kickoff(crewai: Any) -> None:
-    adapter = asyncio.run(
-        MnemosCrewAIAdapter.connect(
-            os.environ["MNEMOS_TEST_BASE"],
-            os.environ["MNEMOS_MCP_TOKEN"],
-            timeout=8,
-        )
+async def _run_live_crew_kickoff(crewai: Any) -> None:
+    adapter = await MnemosCrewAIAdapter.connect(
+        os.environ["MNEMOS_TEST_BASE"],
+        os.environ["MNEMOS_MCP_TOKEN"],
+        timeout=8,
     )
 
     recorder = RecordingDispatcher(adapter._dispatcher)
     adapter._dispatcher = recorder
 
     try:
-        tools = asyncio.run(adapter.crewai_tools())
+        tools = await adapter.crewai_tools()
         assert tools, "Live MNEMOS endpoint did not expose any MCP tools."
 
         tool_names = [str(tool.name) for tool in tools]
@@ -73,9 +71,7 @@ def _run_live_crew_kickoff(crewai: Any) -> None:
                 "the final answer. Do not write, update, or delete memories. "
                 f"Available MNEMOS MCP tools include: {', '.join(tool_names)}."
             ),
-            expected_output=(
-                "A 2 sentence summary of relevant MNEMOS infrastructure memories."
-            ),
+            expected_output=("A 2 sentence summary of relevant MNEMOS infrastructure memories."),
             agent=agent,
         )
         crew = crewai.Crew(
@@ -86,7 +82,7 @@ def _run_live_crew_kickoff(crewai: Any) -> None:
             verbose=False,
         )
 
-        result = crew.kickoff()
+        result = await crew.kickoff_async()
         result_text = _result_to_text(result)
         evidence = _collect_tool_use_evidence(
             crew=crew,
@@ -112,7 +108,7 @@ def _run_live_crew_kickoff(crewai: Any) -> None:
             f"Result was: {result_text[:500]!r}"
         )
     finally:
-        asyncio.run(adapter.aclose())
+        await adapter.aclose()
 
 
 def _build_llm(crewai: Any) -> Any:
@@ -161,10 +157,7 @@ def _collect_tool_use_evidence(
     evidence: list[str] = []
 
     if recorder.calls:
-        evidence.append(
-            "dispatcher.calls="
-            + ",".join(call.name for call in recorder.calls)
-        )
+        evidence.append("dispatcher.calls=" + ",".join(call.name for call in recorder.calls))
 
     used_tools = getattr(task, "used_tools", 0)
     if used_tools:
@@ -193,9 +186,7 @@ def _collect_tool_use_evidence(
 
     result_lower = result_text.lower()
     mentioned_tool_names = [
-        str(tool.name)
-        for tool in tools
-        if str(tool.name).lower() in result_lower
+        str(tool.name) for tool in tools if str(tool.name).lower() in result_lower
     ]
     if mentioned_tool_names:
         evidence.append(f"result.tool_mentions={mentioned_tool_names}")
@@ -213,6 +204,10 @@ class RecordingDispatcher:
     def __init__(self, wrapped: Any) -> None:
         self._wrapped = wrapped
         self.calls: list[RecordedCall] = []
+
+    def call_sync(self, name: str, args: dict[str, Any]) -> str:
+        self.calls.append(RecordedCall(name=name, args=dict(args)))
+        return self._wrapped.call_sync(name, args)
 
     async def call(self, name: str, args: dict[str, Any]) -> str:
         self.calls.append(RecordedCall(name=name, args=dict(args)))

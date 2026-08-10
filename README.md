@@ -55,7 +55,7 @@ async def main() -> None:
         )
 
         crew = Crew(agents=[researcher], tasks=[task])
-        result = crew.kickoff()
+        result = await crew.kickoff_async()
         print(result)
 
 
@@ -83,7 +83,7 @@ The canonical proof of the integration is split into two tiers:
   pytest tests/integration/test_crewai_crew_kickoff.py -v
   ```
 
-The tier-2 test builds a one-agent CrewAI Crew, calls `crew.kickoff()`, records
+The tier-2 test builds a one-agent CrewAI Crew, calls `await crew.kickoff_async()`, records
 the live MCP dispatcher boundary, and verifies that at least one MNEMOS MCP tool
 was invoked end to end. It is skipped unless `MNEMOS_TEST_BASE`,
 `MNEMOS_MCP_TOKEN`, and either `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` are set.
@@ -103,14 +103,12 @@ The adapter supports the JSON Schema shape typically used by MCP tool inputs:
 - `array` fields, exposed to Pydantic as `list`.
 - `object` fields, exposed to Pydantic as `dict`.
 - Required fields, represented as required Pydantic model fields.
-- Optional fields, represented as `Optional[...]` with a default of `None`.
+- Optional fields, with JSON Schema defaults preserved when provided.
 - One-level nested object schemas, represented as `dict`.
 
-Schemas with exotic or ambiguous features fall back to a generic Pydantic model
-with a single `kwargs: dict` field. This includes `oneOf`, `allOf`, `anyOf`,
-`$ref`, conditional schemas, negation schemas, and object nesting deeper than one
-level. The generated fallback model includes a docstring note explaining why the
-generic model was used.
+For schemas with exotic or ambiguous property internals, the adapter preserves
+the MCP tool's top-level argument names and uses broad `dict`, `list`, or `Any`
+annotations where a precise Python type cannot be inferred.
 
 ## Adapter API
 

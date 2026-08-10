@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from types import TracebackType
@@ -116,6 +117,24 @@ class _McpDispatcher:
     def __init__(self, client: Any, *, timeout: int) -> None:
         self._client = client
         self._timeout = timeout
+        self._loop = asyncio.get_running_loop()
+
+    def call_sync(self, name: str, args: dict[str, Any]) -> str:
+        if self._loop.is_closed():
+            raise RuntimeError("The event loop that owns the MNEMOS connection is closed.")
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._loop:
+            raise RuntimeError(
+                "Synchronous CrewAI tool execution cannot run on the MNEMOS connection's "
+                "event loop; use 'await crew.kickoff_async()'."
+            )
+
+        future = asyncio.run_coroutine_threadsafe(self.call(name, args), self._loop)
+        return future.result()
 
     async def call(self, name: str, args: dict[str, Any]) -> str:
         if core_dispatch is not None:
@@ -134,6 +153,13 @@ async def _maybe_await(value: Any) -> Any:
 
 
 def _result_to_text(result: Any) -> str:
+    text = _render_result(result)
+    if bool(getattr(result, "is_error", False)):
+        raise RuntimeError(text)
+    return text
+
+
+def _render_result(result: Any) -> str:
     if isinstance(result, str):
         return result
     if isinstance(result, bytes):

@@ -30,26 +30,12 @@ except ImportError:
                         setattr(self, key, value)
 
 
-EXOTIC_JSON_SCHEMA_KEYS = frozenset(
-    {
-        "$ref",
-        "allOf",
-        "anyOf",
-        "if",
-        "not",
-        "oneOf",
-        "then",
-        "else",
-    }
-)
-
-
 def create_crewai_tool(tool_schema: Any, dispatcher: Any) -> type[BaseTool]:
     """
     Synthesise a CrewAI BaseTool subclass for one MNEMOS tool.
 
-    Exotic JSON Schema features fall back to a generic model with a single
-    ``kwargs: dict`` field.
+    Unsupported property internals are represented by broad Python container
+    types while preserving the MCP tool's top-level argument names.
     """
 
     tool_name = str(tool_schema.name)
@@ -58,6 +44,9 @@ def create_crewai_tool(tool_schema: Any, dispatcher: Any) -> type[BaseTool]:
     class_name = f"{_safe_class_name(tool_name)}Tool"
 
     def _run(self: BaseTool, **kwargs: Any) -> str:
+        call_sync = getattr(dispatcher, "call_sync", None)
+        if call_sync is not None:
+            return call_sync(tool_name, kwargs)
         return asyncio.run(_call_dispatcher(dispatcher, tool_name, kwargs))
 
     async def _arun(self: BaseTool, **kwargs: Any) -> str:
@@ -126,9 +115,18 @@ def _build_args_schema(tool_schema: Any) -> type[BaseModel]:
         if field_name in required:
             fields[field_name] = (field_type, ...)
         else:
-            fields[field_name] = (Optional[field_type], None)
+            default = field_schema.get("default") if isinstance(field_schema, dict) else None
+            fields[field_name] = (Optional[field_type], default)
 
-    return create_model(model_name, **fields)
+    return create_model(model_name, __base__=_McpArgsModel, **fields)
+
+
+class _McpArgsModel(BaseModel):
+    """Keep omitted optional MCP arguments omitted during CrewAI validation."""
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("exclude_unset", True)
+        return super().model_dump(*args, **kwargs)
 
 
 def _requires_generic_kwargs_model(input_schema: Any) -> bool:
@@ -144,48 +142,6 @@ def _requires_generic_kwargs_model(input_schema: Any) -> bool:
         return True
     if not isinstance(required, list):
         return True
-    if _has_exotic_schema_keyword(input_schema):
-        return True
-
-    return any(_has_deep_object_nesting(schema, depth=1) for schema in properties.values())
-
-
-def _has_exotic_schema_keyword(schema: Any) -> bool:
-    if not isinstance(schema, dict):
-        return False
-    if EXOTIC_JSON_SCHEMA_KEYS.intersection(schema):
-        return True
-
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        for property_schema in properties.values():
-            if _has_exotic_schema_keyword(property_schema):
-                return True
-
-    items = schema.get("items")
-    return isinstance(items, dict) and _has_exotic_schema_keyword(items)
-
-
-def _has_deep_object_nesting(schema: Any, *, depth: int) -> bool:
-    if not isinstance(schema, dict):
-        return False
-
-    schema_type = schema.get("type")
-    if schema_type == "object":
-        properties = schema.get("properties")
-        if isinstance(properties, dict):
-            if depth > 1:
-                return True
-            return any(
-                _has_deep_object_nesting(nested_schema, depth=depth + 1)
-                for nested_schema in properties.values()
-            )
-        return False
-
-    if schema_type == "array":
-        items = schema.get("items")
-        return isinstance(items, dict) and _has_deep_object_nesting(items, depth=depth + 1)
-
     return False
 
 
