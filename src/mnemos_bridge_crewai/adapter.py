@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import sys
 from types import TracebackType
@@ -130,6 +131,8 @@ class _McpDispatcher:
     def call_sync(self, name: str, args: dict[str, Any]) -> str:
         if self._loop.is_closed():
             raise RuntimeError("The event loop that owns the MNEMOS connection is closed.")
+        if not self._loop.is_running():
+            raise RuntimeError("The event loop that owns the MNEMOS connection is not running.")
 
         try:
             running_loop = asyncio.get_running_loop()
@@ -142,11 +145,26 @@ class _McpDispatcher:
             )
 
         future = asyncio.run_coroutine_threadsafe(self.call(name, args), self._loop)
-        return future.result()
+        try:
+            return future.result(timeout=self._timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"MNEMOS tool {name!r} did not complete within {self._timeout} seconds."
+            ) from None
 
     async def call(self, name: str, args: dict[str, Any]) -> str:
         if core_dispatch is not None:
-            result = await core_dispatch(self._client, name, args, timeout=self._timeout)
+            # MCP request IDs do not make domain mutations idempotent. The adapter cannot
+            # safely infer that an arbitrary server-provided tool is read-only, so never
+            # replay a call after an ambiguous transport failure.
+            result = await core_dispatch(
+                self._client,
+                name,
+                args,
+                retries=0,
+                timeout=self._timeout,
+            )
         elif hasattr(self._client, "call_tool"):
             result = await self._client.call_tool(name, args)
         else:
@@ -162,9 +180,21 @@ async def _maybe_await(value: Any) -> Any:
 
 def _result_to_text(result: Any) -> str:
     text = _render_result(result)
-    if bool(getattr(result, "is_error", False)):
+    if bool(getattr(result, "is_error", False)) or bool(getattr(result, "isError", False)):
+        raise RuntimeError(text)
+    if _is_structured_error_text(text):
         raise RuntimeError(text)
     return text
+
+
+def _is_structured_error_text(text: str) -> bool:
+    """Recognize the structured failure envelope emitted by MNEMOS MCP transports."""
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "error" in payload and payload.get("success") is not True
 
 
 def _render_result(result: Any) -> str:

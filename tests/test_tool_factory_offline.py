@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, get_args, get_origin
+import pytest
+from pydantic import BaseModel, ValidationError
 
 from mnemos_bridge_crewai.tool_factory import BaseTool, _get_args_schema_model, create_crewai_tool
 
@@ -46,7 +47,7 @@ def test_simple_schema_required_string_and_optional_int_fields() -> None:
 
     assert fields["query"].annotation is str
     assert fields["query"].is_required()
-    assert _is_optional_of(fields["limit"].annotation, int)
+    assert fields["limit"].annotation is int
     assert not fields["limit"].is_required()
     assert fields["limit"].default == 10
     assert fields["mode"].default == "semantic"
@@ -56,13 +57,19 @@ def test_simple_schema_required_string_and_optional_int_fields() -> None:
     assert dispatcher.calls == [("search_memories", {"query": "x"})]
 
 
-def test_array_field_uses_list_annotation() -> None:
+def test_array_field_preserves_item_type_and_size_constraints() -> None:
     schema = ToolSchemaStub(
         name="tag_memories",
         description="Tag memories.",
         input_schema={
             "type": "object",
-            "properties": {"tags": {"type": "array"}},
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 2,
+                }
+            },
             "required": ["tags"],
         },
     )
@@ -71,7 +78,12 @@ def test_array_field_uses_list_annotation() -> None:
     args_schema = _get_args_schema_model(tool_cls)
 
     assert args_schema is not None
-    assert args_schema.model_fields["tags"].annotation is list
+    assert args_schema.model_fields["tags"].annotation == list[str]
+    args_schema.model_validate({"tags": ["one", "two"]})
+    with pytest.raises(ValidationError):
+        args_schema.model_validate({"tags": ["one", "two", "three"]})
+    with pytest.raises(ValidationError):
+        args_schema.model_validate({"tags": [1]})
 
 
 def test_boolean_field_uses_bool_annotation() -> None:
@@ -92,7 +104,7 @@ def test_boolean_field_uses_bool_annotation() -> None:
     assert args_schema.model_fields["enabled"].annotation is bool
 
 
-def test_nested_object_field_one_level_uses_dict_annotation() -> None:
+def test_nested_object_preserves_properties_and_required_fields() -> None:
     schema = ToolSchemaStub(
         name="write_memory",
         description="Write memory.",
@@ -102,9 +114,10 @@ def test_nested_object_field_one_level_uses_dict_annotation() -> None:
                 "metadata": {
                     "type": "object",
                     "properties": {
-                        "source": {"type": "string"},
+                        "source": {"type": "string", "description": "Origin."},
                         "priority": {"type": "integer"},
                     },
+                    "required": ["source"],
                 }
             },
             "required": ["metadata"],
@@ -115,7 +128,11 @@ def test_nested_object_field_one_level_uses_dict_annotation() -> None:
     args_schema = _get_args_schema_model(tool_cls)
 
     assert args_schema is not None
-    assert args_schema.model_fields["metadata"].annotation is dict
+    metadata_model = args_schema.model_fields["metadata"].annotation
+    assert issubclass(metadata_model, BaseModel)
+    assert metadata_model.model_json_schema()["properties"]["source"]["description"] == "Origin."
+    with pytest.raises(ValidationError):
+        args_schema.model_validate({"metadata": {"priority": 1}})
 
 
 def test_exotic_schema_preserves_top_level_argument_names() -> None:
@@ -156,7 +173,9 @@ def test_deep_array_schema_dispatches_under_original_top_level_name() -> None:
                     "items": {
                         "type": "object",
                         "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
                     },
+                    "maxItems": 2,
                 }
             },
             "required": ["memories"],
@@ -168,6 +187,46 @@ def test_deep_array_schema_dispatches_under_original_top_level_name() -> None:
 
     assert tool.run(memories=memories) == '{"ok": true}'
     assert dispatcher.calls == [("bulk_create_memories", {"memories": memories})]
+
+    args_schema = _get_args_schema_model(type(tool))
+    assert args_schema is not None
+    with pytest.raises(ValidationError):
+        args_schema.model_validate({"memories": [1]})
+    with pytest.raises(ValidationError):
+        args_schema.model_validate({"memories": [{}]})
+
+
+def test_optional_non_nullable_enum_and_numeric_bounds_are_preserved() -> None:
+    schema = ToolSchemaStub(
+        name="search_memories",
+        description="Search memories.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum results.",
+                },
+                "mode": {"type": "string", "enum": ["semantic", "keyword"]},
+            },
+        },
+    )
+
+    args_schema = _get_args_schema_model(create_crewai_tool(schema, DispatcherStub()))
+    assert args_schema is not None
+    generated = args_schema.model_json_schema()
+    assert generated["properties"]["limit"]["description"] == "Maximum results."
+    assert generated["properties"]["limit"]["minimum"] == 1
+    assert generated["properties"]["limit"]["maximum"] == 100
+    assert generated["properties"]["mode"]["enum"] == ["semantic", "keyword"]
+    assert "anyOf" not in generated["properties"]["limit"]
+    assert "default" not in generated["properties"]["limit"]
+    assert args_schema.model_validate({}).model_dump() == {}
+    for invalid in ({"limit": None}, {"limit": 0}, {"mode": "invalid"}):
+        with pytest.raises(ValidationError):
+            args_schema.model_validate(invalid)
 
 
 def test_created_tool_metadata_and_args_schema_match_schema() -> None:
@@ -209,12 +268,3 @@ def test_run_is_callable_and_invokes_dispatcher() -> None:
     assert callable(tool._run)
     assert tool._run(query="mnemos") == '{"ok": true}'
     assert dispatcher.calls == [("search_memories", {"query": "mnemos"})]
-
-
-def _is_optional_of(annotation: object, expected: type) -> bool:
-    origin = get_origin(annotation)
-    return origin is Optional or (
-        origin is not None
-        and type(None) in get_args(annotation)
-        and expected in get_args(annotation)
-    )

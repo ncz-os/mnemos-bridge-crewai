@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import patch
+import json
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -98,6 +99,74 @@ def test_mcp_error_result_raises_with_server_text() -> None:
 
     with pytest.raises(RuntimeError, match="invalid limit"):
         _result_to_text(ErrorResult([TextBlock("invalid limit")]))
+
+
+def test_mcp_camel_case_error_result_raises_with_server_text() -> None:
+    @dataclass
+    class ErrorResult:
+        content: list[dict[str, str]]
+        isError: bool = True
+
+    with pytest.raises(RuntimeError, match="unauthorized"):
+        _result_to_text(ErrorResult([{"text": "unauthorized"}]))
+
+
+def test_mnemos_structured_error_returned_as_text_raises() -> None:
+    payload = json.dumps({"success": False, "error": "limit must be an integer"})
+
+    with pytest.raises(RuntimeError, match="limit must be an integer"):
+        _result_to_text(payload)
+
+
+async def test_dispatch_explicitly_disables_retries() -> None:
+    result = type("Result", (), {"content": [], "is_error": False})()
+    dispatch = AsyncMock(return_value=result)
+    dispatcher = _McpDispatcher(FakeMcpClient("url", token="token", timeout=1), timeout=1)
+
+    with patch("mnemos_bridge_crewai.adapter.core_dispatch", dispatch):
+        await dispatcher.call("create_memory", {"content": "once"})
+
+    dispatch.assert_awaited_once_with(
+        dispatcher._client,
+        "create_memory",
+        {"content": "once"},
+        retries=0,
+        timeout=1,
+    )
+
+
+def test_sync_dispatch_rejects_stopped_owner_loop() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        async def build_dispatcher() -> _McpDispatcher:
+            return _McpDispatcher(FakeMcpClient("url", token="token", timeout=1), timeout=1)
+
+        dispatcher = loop.run_until_complete(build_dispatcher())
+        with pytest.raises(RuntimeError, match="not running"):
+            dispatcher.call_sync("search_memories", {"query": "x"})
+    finally:
+        loop.close()
+
+
+async def test_sync_dispatch_wait_is_bounded_and_cancels_call() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class SlowClient:
+        async def call_tool(self, name: str, args: dict) -> str:
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
+
+    dispatcher = _McpDispatcher(SlowClient(), timeout=0.01)
+    with patch("mnemos_bridge_crewai.adapter.core_dispatch", None):
+        with pytest.raises(TimeoutError, match="did not complete"):
+            await asyncio.to_thread(dispatcher.call_sync, "search_memories", {"query": "x"})
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
 
 
 def _schema(field_name: str) -> dict:

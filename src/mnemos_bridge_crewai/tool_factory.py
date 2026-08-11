@@ -4,9 +4,9 @@ import asyncio
 import inspect
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Literal
 
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 try:
     from crewai.tools import BaseTool
@@ -40,8 +40,7 @@ def create_crewai_tool(tool_schema: Any, dispatcher: Any) -> type[BaseTool]:
     """
     Synthesise a CrewAI BaseTool subclass for one MNEMOS tool.
 
-    Unsupported property internals are represented by broad Python container
-    types while preserving the MCP tool's top-level argument names.
+    The generated Pydantic model preserves the MCP tool's JSON Schema contract.
     """
 
     tool_name = str(tool_schema.name)
@@ -103,7 +102,7 @@ def _build_args_schema(tool_schema: Any) -> type[BaseModel]:
     input_schema = getattr(tool_schema, "input_schema", {}) or {}
     model_name = f"{_safe_class_name(str(tool_schema.name))}Args"
 
-    if _requires_generic_kwargs_model(input_schema):
+    if not _is_object_schema(input_schema):
         model = create_model(model_name, kwargs=(dict, ...))
         model.__doc__ = (
             "Generic kwargs model. The source JSON Schema uses unsupported "
@@ -112,63 +111,138 @@ def _build_args_schema(tool_schema: Any) -> type[BaseModel]:
         )
         return model
 
-    properties = input_schema.get("properties") or {}
-    required = set(input_schema.get("required") or [])
-    fields: dict[str, tuple[Any, Any]] = {}
-
-    for field_name, field_schema in properties.items():
-        field_type = _json_schema_type_to_python(field_schema)
-        if field_name in required:
-            fields[field_name] = (field_type, ...)
-        else:
-            default = field_schema.get("default") if isinstance(field_schema, dict) else None
-            fields[field_name] = (Optional[field_type], default)
-
-    return create_model(model_name, __base__=_McpArgsModel, **fields)
+    return _object_schema_to_model(input_schema, model_name)
 
 
 class _McpArgsModel(BaseModel):
     """Keep omitted optional MCP arguments omitted during CrewAI validation."""
+
+    model_config = ConfigDict(strict=True)
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         kwargs.setdefault("exclude_unset", True)
         return super().model_dump(*args, **kwargs)
 
 
-def _requires_generic_kwargs_model(input_schema: Any) -> bool:
+def _is_object_schema(input_schema: Any) -> bool:
     if not isinstance(input_schema, dict):
-        return True
-
+        return False
     properties = input_schema.get("properties", {})
     required = input_schema.get("required", [])
-    if properties is None:
-        properties = {}
-
-    if not isinstance(properties, dict):
-        return True
-    if not isinstance(required, list):
-        return True
-    return False
+    return isinstance(properties, dict) and isinstance(required, list)
 
 
-def _json_schema_type_to_python(field_schema: Any) -> Any:
+def _object_schema_to_model(schema: dict[str, Any], model_name: str) -> type[BaseModel]:
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    fields: dict[str, tuple[Any, Any]] = {}
+
+    for field_name, field_schema in properties.items():
+        annotation = _json_schema_type_to_python(
+            field_schema,
+            nested_model_name=f"{model_name}{_safe_class_name(field_name)}",
+        )
+        schema_dict = field_schema if isinstance(field_schema, dict) else {}
+        default = ... if field_name in required else schema_dict.get("default")
+        fields[field_name] = (
+            annotation,
+            _schema_field(
+                schema_dict,
+                default,
+                hide_implicit_none=field_name not in required and "default" not in schema_dict,
+            ),
+        )
+
+    model = create_model(model_name, __base__=_McpArgsModel, **fields)
+    description = schema.get("description")
+    if isinstance(description, str):
+        model.__doc__ = description
+    return model
+
+
+def _schema_field(
+    schema: dict[str, Any],
+    default: Any,
+    *,
+    hide_implicit_none: bool = False,
+) -> Any:
+    kwargs: dict[str, Any] = {}
+    keyword_map = {
+        "description": "description",
+        "minimum": "ge",
+        "maximum": "le",
+        "exclusiveMinimum": "gt",
+        "exclusiveMaximum": "lt",
+        "multipleOf": "multiple_of",
+        "minLength": "min_length",
+        "maxLength": "max_length",
+        "pattern": "pattern",
+        "minItems": "min_length",
+        "maxItems": "max_length",
+    }
+    for json_name, field_name in keyword_map.items():
+        if json_name in schema:
+            kwargs[field_name] = schema[json_name]
+    if hide_implicit_none:
+        kwargs["json_schema_extra"] = _remove_implicit_none_default
+    return Field(default, **kwargs)
+
+
+def _remove_implicit_none_default(json_schema: dict[str, Any]) -> None:
+    if json_schema.get("default") is None:
+        json_schema.pop("default", None)
+
+
+def _json_schema_type_to_python(
+    field_schema: Any,
+    *,
+    nested_model_name: str = "NestedMcpArgs",
+) -> Any:
     if not isinstance(field_schema, dict):
         return Any
 
     schema_type = field_schema.get("type")
+    nullable = isinstance(schema_type, list) and "null" in schema_type
+    if isinstance(schema_type, list):
+        non_null_types = [item for item in schema_type if item != "null"]
+        schema_type = non_null_types[0] if len(non_null_types) == 1 else None
+
+    enum_values = field_schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        annotation = Literal.__getitem__(tuple(enum_values))
+        return annotation | None if nullable else annotation
+
     if schema_type == "string":
-        return str
-    if schema_type == "integer":
-        return int
-    if schema_type == "number":
-        return float
-    if schema_type == "boolean":
-        return bool
-    if schema_type == "array":
-        return list
-    if schema_type == "object":
-        return dict
-    return Any
+        annotation = str
+    elif schema_type == "integer":
+        annotation = int
+    elif schema_type == "number":
+        annotation = float
+    elif schema_type == "boolean":
+        annotation = bool
+    elif schema_type == "array":
+        item_type = _json_schema_type_to_python(
+            field_schema.get("items", {}),
+            nested_model_name=f"{nested_model_name}Item",
+        )
+        annotation = list[item_type]
+    elif schema_type == "object" and _is_object_schema(field_schema):
+        annotation = _object_schema_to_model(field_schema, nested_model_name)
+    elif schema_type == "object":
+        additional = field_schema.get("additionalProperties")
+        value_type = (
+            _json_schema_type_to_python(
+                additional,
+                nested_model_name=f"{nested_model_name}Value",
+            )
+            if isinstance(additional, dict)
+            else Any
+        )
+        annotation = dict[str, value_type]
+    else:
+        annotation = Any
+
+    return annotation | None if nullable and annotation is not Any else annotation
 
 
 async def _call_dispatcher(dispatcher: Any, tool_name: str, kwargs: dict[str, Any]) -> str:
