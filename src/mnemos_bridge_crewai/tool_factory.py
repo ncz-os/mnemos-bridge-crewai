@@ -117,17 +117,23 @@ def _build_args_schema(tool_schema: Any) -> type[BaseModel]:
 class _McpArgsModel(BaseModel):
     """Keep omitted optional MCP arguments omitted during CrewAI validation."""
 
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="allow")
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         kwargs.setdefault("exclude_unset", True)
         return super().model_dump(*args, **kwargs)
 
 
+class _ClosedMcpArgsModel(_McpArgsModel):
+    """Reject object keys when the MCP schema explicitly disallows them."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+
 def _is_object_schema(input_schema: Any) -> bool:
     if not isinstance(input_schema, dict):
         return False
-    properties = input_schema.get("properties", {})
+    properties = input_schema.get("properties")
     required = input_schema.get("required", [])
     return isinstance(properties, dict) and isinstance(required, list)
 
@@ -153,7 +159,12 @@ def _object_schema_to_model(schema: dict[str, Any], model_name: str) -> type[Bas
             ),
         )
 
-    model = create_model(model_name, __base__=_McpArgsModel, **fields)
+    model_base = (
+        _ClosedMcpArgsModel
+        if schema.get("additionalProperties") is False
+        else _McpArgsModel
+    )
+    model = create_model(model_name, __base__=model_base, **fields)
     description = schema.get("description")
     if isinstance(description, str):
         model.__doc__ = description

@@ -135,6 +135,72 @@ def test_nested_object_preserves_properties_and_required_fields() -> None:
         args_schema.model_validate({"metadata": {"priority": 1}})
 
 
+def test_unconstrained_objects_preserve_metadata_and_array_item_contents() -> None:
+    schema = ToolSchemaStub(
+        name="create_and_route",
+        description="Create a memory and explain routing.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "metadata": {"type": "object"},
+                "messages": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["content", "messages"],
+        },
+    )
+    args_schema = _get_args_schema_model(create_crewai_tool(schema, DispatcherStub()))
+    payload = {
+        "content": "x",
+        "metadata": {"source": "jira", "priority": 1},
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    assert args_schema is not None
+    assert args_schema.model_validate(payload).model_dump() == payload
+
+
+def test_structured_objects_preserve_extras_unless_explicitly_forbidden() -> None:
+    schema = ToolSchemaStub(
+        name="write_memory",
+        description="Write memory metadata.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "open_metadata": {
+                    "type": "object",
+                    "properties": {"source": {"type": "string"}},
+                    "required": ["source"],
+                },
+                "closed_metadata": {
+                    "type": "object",
+                    "properties": {"source": {"type": "string"}},
+                    "required": ["source"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["open_metadata", "closed_metadata"],
+        },
+    )
+    args_schema = _get_args_schema_model(create_crewai_tool(schema, DispatcherStub()))
+
+    assert args_schema is not None
+    validated = args_schema.model_validate(
+        {
+            "open_metadata": {"source": "jira", "priority": 1},
+            "closed_metadata": {"source": "jira"},
+        }
+    )
+    assert validated.model_dump()["open_metadata"] == {"source": "jira", "priority": 1}
+    with pytest.raises(ValidationError):
+        args_schema.model_validate(
+            {
+                "open_metadata": {"source": "jira"},
+                "closed_metadata": {"source": "jira", "priority": 1},
+            }
+        )
+
+
 def test_exotic_schema_preserves_top_level_argument_names() -> None:
     schema = ToolSchemaStub(
         name="exotic_memory",
