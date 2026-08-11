@@ -8,7 +8,11 @@ import pytest
 from mnemos_bridge_crewai import MnemosCrewAIAdapter
 
 
-DEFAULT_MNEMOS_TEST_BASE = "http://192.168.207.67:5003"
+DEFAULT_MNEMOS_TEST_BASE = "http://192.168.207.67:5003/sse"
+
+
+def test_default_mnemos_endpoint_targets_sse_route() -> None:
+    assert DEFAULT_MNEMOS_TEST_BASE.endswith("/sse")
 
 
 @pytest.mark.asyncio

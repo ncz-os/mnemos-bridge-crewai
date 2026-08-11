@@ -14,7 +14,7 @@ pip install mnemos-bridge-crewai
 Set the MNEMOS MCP endpoint and token before running your CrewAI process:
 
 ```bash
-export MNEMOS_MCP_URL="http://192.168.207.67:5003"
+export MNEMOS_MCP_URL="http://192.168.207.67:5003/sse"
 export MNEMOS_MCP_TOKEN="your-mnemos-token"
 ```
 
@@ -77,7 +77,7 @@ The canonical proof of the integration is split into two tiers:
 - Tier 2 live CrewAI kickoff test against a real MNEMOS MCP HTTP/SSE endpoint:
 
   ```bash
-  export MNEMOS_TEST_BASE="http://192.168.207.67:5003"
+  export MNEMOS_TEST_BASE="http://192.168.207.67:5003/sse"
   export MNEMOS_MCP_TOKEN="your-mnemos-token"
   export OPENAI_API_KEY="your-openai-key"
   pytest tests/integration/test_crewai_crew_kickoff.py -v
