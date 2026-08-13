@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnemos-bridge-crewai"
-version = "0.1.1"
+version = "0.1.2"
 description = "CrewAI adapter for MNEMOS MCP tools."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
-    "mnemos-bridge-core>=0.1.0",
+    "mnemos-bridge-core>=0.1.4",
     "mcp>=1.0,<2",
     "crewai>=0.80",
     "pydantic>=2.8",
