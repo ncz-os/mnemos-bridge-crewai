@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import sys
+import warnings
+from collections.abc import Sequence
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import TracebackType
 from typing import Any
 
@@ -18,6 +20,14 @@ except ImportError:  # pragma: no cover - compatibility fallback for older core 
     core_dispatch = None
 
 from .tool_factory import create_crewai_tool
+from .tool_policy import filter_tool_schemas, is_destructive_tool_name, tool_schema_name
+
+
+class _Unset:
+    """Sentinel marking "use the policy configured on the adapter"."""
+
+
+_UNSET: Any = _Unset()
 
 
 class MnemosCrewAIAdapter:
@@ -29,14 +39,29 @@ class MnemosCrewAIAdapter:
         tool_schemas: list[Any],
         dispatcher: Any,
         owns_context: bool,
+        readonly: bool = True,
+        allowed_tools: Sequence[str] | None = None,
+        denied_tools: Sequence[str] | None = None,
     ) -> None:
         self._client = client
         self._client_context = client_context
         self._tool_schemas = tool_schemas
         self._dispatcher = dispatcher
         self._owns_context = owns_context
-        self._tools: list[Any] | None = None
+        self._readonly = readonly
+        self._allowed_tools = None if allowed_tools is None else list(allowed_tools)
+        self._denied_tools = None if denied_tools is None else list(denied_tools)
+        self._tool_classes: dict[str, type[Any]] = {}
+        self._tool_instances: dict[str, Any] = {}
+        self._cached_dispatcher: Any = None
+        self._warned_about_hidden_tools = False
         self._closed = False
+
+    @property
+    def tool_schemas(self) -> list[Any]:
+        """Return all schemas advertised by the server, before policy filtering."""
+
+        return list(self._tool_schemas)
 
     @classmethod
     async def connect(
@@ -45,8 +70,11 @@ class MnemosCrewAIAdapter:
         mcp_token: str,
         *,
         timeout: int = 30,
+        readonly: bool = True,
+        allowed_tools: Sequence[str] | None = None,
+        denied_tools: Sequence[str] | None = None,
     ) -> MnemosCrewAIAdapter:
-        """Connect to MNEMOS MCP HTTP/SSE endpoint and list available tools."""
+        """Connect to MNEMOS and configure the default tool-exposure policy."""
 
         client_context = cls._build_client(mcp_url, mcp_token, timeout)
         client = client_context
@@ -72,20 +100,96 @@ class MnemosCrewAIAdapter:
             tool_schemas=list(tool_schemas),
             dispatcher=dispatcher,
             owns_context=owns_context,
+            readonly=readonly,
+            allowed_tools=allowed_tools,
+            denied_tools=denied_tools,
         )
 
-    async def crewai_tools(self) -> list[Any]:
-        """Return one CrewAI BaseTool instance per MNEMOS tool."""
+    async def crewai_tools(
+        self,
+        *,
+        readonly: bool = _UNSET,
+        allowed_tools: Sequence[str] | None = _UNSET,
+        denied_tools: Sequence[str] | None = _UNSET,
+    ) -> list[Any]:
+        """Return one CrewAI ``BaseTool`` instance per permitted MNEMOS tool."""
 
         if self._closed:
             raise RuntimeError("MnemosCrewAIAdapter is closed.")
 
-        if self._tools is None:
-            self._tools = [
-                create_crewai_tool(tool_schema, self._dispatcher)()
-                for tool_schema in self._tool_schemas
-            ]
-        return list(self._tools)
+        if self._cached_dispatcher is not self._dispatcher:
+            self._tool_classes.clear()
+            self._tool_instances.clear()
+            self._cached_dispatcher = self._dispatcher
+
+        effective_readonly = self._readonly if readonly is _UNSET else readonly
+        effective_allowed = self._allowed_tools if allowed_tools is _UNSET else allowed_tools
+        effective_denied = self._denied_tools if denied_tools is _UNSET else denied_tools
+        permitted = filter_tool_schemas(
+            self._tool_schemas,
+            readonly=effective_readonly,
+            allowed_tools=effective_allowed,
+            denied_tools=effective_denied,
+        )
+        self._warn_about_hidden_tools(
+            permitted,
+            readonly=effective_readonly,
+            allowed_tools=effective_allowed,
+        )
+
+        tools: list[Any] = []
+        seen: set[str] = set()
+        for tool_schema in permitted:
+            name = tool_schema_name(tool_schema)
+            if name in seen:
+                warnings.warn(
+                    f"The MCP server advertised more than one tool named {name!r}; "
+                    "only the first is exposed to CrewAI.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            seen.add(name)
+
+            instance = self._tool_instances.get(name)
+            if instance is None:
+                tool_cls = self._tool_classes.get(name)
+                if tool_cls is None:
+                    tool_cls = create_crewai_tool(tool_schema, self._dispatcher)
+                    self._tool_classes[name] = tool_cls
+                instance = tool_cls()
+                self._tool_instances[name] = instance
+            tools.append(instance)
+        return tools
+
+    def _warn_about_hidden_tools(
+        self,
+        permitted: list[Any],
+        *,
+        readonly: bool,
+        allowed_tools: Sequence[str] | None,
+    ) -> None:
+        if allowed_tools is not None or not readonly or self._warned_about_hidden_tools:
+            return
+
+        permitted_names = {tool_schema_name(schema) for schema in permitted}
+        hidden = sorted(
+            name
+            for name in (tool_schema_name(schema) for schema in self._tool_schemas)
+            if name not in permitted_names and is_destructive_tool_name(name)
+        )
+        if not hidden:
+            return
+
+        self._warned_about_hidden_tools = True
+        warnings.warn(
+            "mnemos-bridge-crewai is running read-only and did not expose "
+            f"{len(hidden)} tool(s) outside its explicit safe allowlist: "
+            f"{', '.join(hidden)}. Pass readonly=False, or allowed_tools=[...], "
+            "to expose them deliberately.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     async def aclose(self) -> None:
         if self._closed:
@@ -113,8 +217,7 @@ class MnemosCrewAIAdapter:
     def _build_client(mcp_url: str, mcp_token: str, timeout: int) -> Any:
         if McpClient is None:
             raise RuntimeError(
-                "mnemos_bridge_core is required to connect. "
-                "Install mnemos-bridge-core>=0.1.0."
+                "mnemos_bridge_core is required to connect. Install mnemos-bridge-core>=0.1.0."
             )
         factory = getattr(McpClient, "from_url", None)
         if factory is not None:

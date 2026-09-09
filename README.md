@@ -18,6 +18,44 @@ export MNEMOS_MCP_URL="http://192.168.207.67:5003/sse"
 export MNEMOS_MCP_TOKEN="your-mnemos-token"
 ```
 
+## Tool exposure is read-only by default
+
+The adapter exposes only the tool names in its reviewed read-only allowlist
+unless you opt in to broader access. The allowlist mirrors the canonical MNEMOS
+server contract in `mnemos/mcp/tools/__init__.py`; unknown names are withheld,
+even when they do not contain an obviously mutating verb. This fail-closed
+behavior prevents a newly advertised or attacker-invented tool from acquiring
+CrewAI access by default.
+
+The default includes read operations such as `search_memories`, `log_memory`,
+and `checkout_memory`. It excludes writes such as `create_memory`,
+`update_memory`, `delete_memory`, and `branch_memory`.
+
+```python
+# Default: only explicitly known read-only tools.
+adapter = await MnemosCrewAIAdapter.connect(url, token)
+
+# Exact opt-in: an explicit allowlist supersedes read-only mode.
+adapter = await MnemosCrewAIAdapter.connect(
+    url,
+    token,
+    allowed_tools=["search_memories", "create_memory"],
+)
+
+# An empty allowlist permits nothing.
+adapter = await MnemosCrewAIAdapter.connect(url, token, allowed_tools=[])
+
+# A denylist is always subtractive and is applied last.
+adapter = await MnemosCrewAIAdapter.connect(
+    url,
+    token,
+    denied_tools=["checkout_memory"],
+)
+
+# Restore unrestricted pre-policy exposure explicitly.
+adapter = await MnemosCrewAIAdapter.connect(url, token, readonly=False)
+```
+
 ## Working Example
 
 ```python
@@ -35,6 +73,7 @@ async def main() -> None:
     )
 
     async with adapter:
+        # Only tools on the explicit read-only allowlist are returned by default.
         mnemos_tools = await adapter.crewai_tools()
 
         researcher = Agent(
@@ -112,16 +151,22 @@ annotations where a precise Python type cannot be inferred.
 
 ## Adapter API
 
-### `MnemosCrewAIAdapter.connect(mcp_url, mcp_token, *, timeout=30)`
+### `MnemosCrewAIAdapter.connect(mcp_url, mcp_token, *, timeout=30, readonly=True, allowed_tools=None, denied_tools=None)`
 
 Connects to a MNEMOS MCP HTTP/SSE endpoint, opens the underlying MCP client, and
-stores the raw tool schemas returned by `list_tools()`.
+stores the raw tool schemas returned by `list_tools()`. The tool-exposure
+arguments establish the default policy for `crewai_tools()`.
 
-### `adapter.crewai_tools()`
+### `adapter.crewai_tools(*, readonly=..., allowed_tools=..., denied_tools=...)`
 
-Returns one CrewAI `BaseTool` instance for each MNEMOS MCP tool. Conversion is
-lazy: tool classes and Pydantic argument schemas are generated the first time this
-method is called.
+Returns one CrewAI `BaseTool` instance for each permitted MNEMOS MCP tool. Any
+argument left unset inherits the policy configured by `connect()`. Conversion is
+lazy and generated tool instances are cached by name.
+
+### `adapter.tool_schemas`
+
+Returns every tool schema the server advertised before policy filtering, so a
+caller can inspect which tools were withheld.
 
 ### `adapter.aclose()`
 

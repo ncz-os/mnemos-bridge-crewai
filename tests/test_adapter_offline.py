@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import json
+import warnings
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from mnemos_bridge_crewai.adapter import MnemosCrewAIAdapter, _McpDispatcher, _result_to_text
 from mnemos_bridge_crewai.tool_factory import BaseTool, create_crewai_tool
+from mnemos_bridge_crewai.tool_policy import (
+    READ_ONLY_TOOL_NAMES,
+    filter_tool_schemas,
+    is_destructive_tool_name,
+    is_read_only_tool_name,
+)
 
 
 @dataclass
@@ -40,34 +47,160 @@ class FakeMcpClient:
     async def list_tools(self) -> list[ToolSchemaStub]:
         return [
             ToolSchemaStub("search_memories", "Search memories.", _schema("query")),
+            ToolSchemaStub("log_memory", "Read commit history.", _schema("memory_id")),
+            ToolSchemaStub("checkout_memory", "Read a commit.", _schema("memory_id")),
             ToolSchemaStub("write_memory", "Write memory.", _schema("content")),
             ToolSchemaStub("delete_memory", "Delete memory.", _schema("memory_id")),
+            ToolSchemaStub("grant_memory_access", "Invented mutation.", _schema("user_id")),
         ]
 
     async def call_tool(self, name: str, args: dict) -> str:
         return '{"ok": true}'
 
 
-async def test_connect_succeeds_without_network_and_returns_crewai_tools() -> None:
+async def _connect(**kwargs: object) -> MnemosCrewAIAdapter:
     with patch("mnemos_bridge_crewai.adapter.McpClient", FakeMcpClient):
-        adapter = await MnemosCrewAIAdapter.connect(
+        return await MnemosCrewAIAdapter.connect(
             "http://mnemos.example/mcp",
             "test-token",
             timeout=3,
+            **kwargs,
         )
+
+
+async def test_connect_defaults_to_the_explicit_read_only_allowlist() -> None:
+    adapter = await _connect()
+
+    try:
+        with pytest.warns(UserWarning, match="explicit safe allowlist"):
+            tools = await adapter.crewai_tools()
+    finally:
+        await adapter.aclose()
+
+    assert all(isinstance(tool, BaseTool) for tool in tools)
+    assert [tool.name for tool in tools] == [
+        "search_memories",
+        "log_memory",
+        "checkout_memory",
+    ]
+    assert [schema.name for schema in adapter.tool_schemas] == [
+        "search_memories",
+        "log_memory",
+        "checkout_memory",
+        "write_memory",
+        "delete_memory",
+        "grant_memory_access",
+    ]
+
+
+async def test_default_policy_rejects_invented_mutating_tool_name() -> None:
+    adapter = await _connect()
+
+    try:
+        with pytest.warns(UserWarning, match="grant_memory_access"):
+            tools = await adapter.crewai_tools()
+    finally:
+        await adapter.aclose()
+
+    assert "grant_memory_access" not in {tool.name for tool in tools}
+
+
+async def test_readonly_false_restores_unrestricted_exposure() -> None:
+    adapter = await _connect(readonly=False)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            tools = await adapter.crewai_tools()
+    finally:
+        await adapter.aclose()
+
+    assert [tool.name for tool in tools] == [
+        "search_memories",
+        "log_memory",
+        "checkout_memory",
+        "write_memory",
+        "delete_memory",
+        "grant_memory_access",
+    ]
+
+
+async def test_explicit_allowlist_can_opt_in_a_write_and_denied_tools_wins() -> None:
+    adapter = await _connect(
+        allowed_tools=["search_memories", "write_memory"],
+        denied_tools=["search_memories"],
+    )
 
     try:
         tools = await adapter.crewai_tools()
     finally:
         await adapter.aclose()
 
-    assert len(tools) == 3
-    assert all(isinstance(tool, BaseTool) for tool in tools)
-    assert [tool.name for tool in tools] == [
+    assert [tool.name for tool in tools] == ["write_memory"]
+
+
+async def test_empty_explicit_allowlist_permits_nothing() -> None:
+    adapter = await _connect(allowed_tools=[])
+
+    try:
+        assert await adapter.crewai_tools() == []
+    finally:
+        await adapter.aclose()
+
+
+def test_read_only_allowlist_exactly_matches_the_server_contract() -> None:
+    assert READ_ONLY_TOOL_NAMES == {
         "search_memories",
-        "write_memory",
+        "get_memory",
+        "list_memories",
+        "get_stats",
+        "kg_search",
+        "kg_timeline",
+        "log_memory",
+        "diff_memory_commits",
+        "checkout_memory",
+        "recommend_model",
+        "pantheon_list_models",
+        "pantheon_route_explain",
+        "graeae_consult",
+        "graeae_get_consultation",
+        "list_deletions",
+        "kronos_anomalies",
+        "kronos_forecast",
+    }
+
+
+@pytest.mark.parametrize("name", ["log_memory", "checkout_memory"])
+def test_dag_read_tools_are_not_misclassified_as_destructive(name: str) -> None:
+    assert is_read_only_tool_name(name)
+    assert not is_destructive_tool_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "create_memory",
+        "update_memory",
         "delete_memory",
+        "branch_memory",
+        "grant_memory_access",
+        "rotate_api_key",
+    ],
+)
+def test_mutating_and_unknown_names_are_withheld_by_default(name: str) -> None:
+    assert not is_read_only_tool_name(name)
+    assert is_destructive_tool_name(name)
+
+
+def test_filter_tool_schemas_fails_closed_for_unknown_names() -> None:
+    schemas = [
+        {"name": "search_memories"},
+        {"name": "checkout_memory"},
+        {"name": "grant_memory_access"},
     ]
+
+    assert filter_tool_schemas(schemas) == schemas[:2]
+    assert filter_tool_schemas(schemas, readonly=False) == schemas
 
 
 async def test_sync_tool_run_from_worker_dispatches_on_connection_loop() -> None:
@@ -138,6 +271,7 @@ async def test_dispatch_explicitly_disables_retries() -> None:
 def test_sync_dispatch_rejects_stopped_owner_loop() -> None:
     loop = asyncio.new_event_loop()
     try:
+
         async def build_dispatcher() -> _McpDispatcher:
             return _McpDispatcher(FakeMcpClient("url", token="token", timeout=1), timeout=1)
 
