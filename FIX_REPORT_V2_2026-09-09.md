@@ -27,7 +27,7 @@ matching the MNEMOS server contract.
 The source of truth inspected for the policy was:
 
 - `/Users/jasonperlow/Projects/mnemos/mnemos/mcp/tools/__init__.py`
-- local repository commit: `8eea172301ea98b63fe40f5abac4a16f5f680601`
+- local repository commit: `5c756437a195ffe2e14934d49222b905e5d34d4e`
 - file SHA-256: `828fed9e5dbf51dd995f3658d0e08beb992eca423f31940de7d85081ac003027`
 
 The same file hash was present in two other current local MNEMOS checkouts.
